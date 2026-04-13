@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Sam Audio</title>
+<style>
+body { margin:0; background:#111; display:flex; align-items:center; justify-content:center; height:100vh; font-family:system-ui; color:#fff; }
+.container { text-align:center; }
+.avatar { width:120px; height:120px; border-radius:50%; background:linear-gradient(135deg,#3b82f6,#8b5cf6); display:flex; align-items:center; justify-content:center; font-size:48px; margin:0 auto 16px; transition:box-shadow 0.3s; }
+.avatar.speaking { box-shadow:0 0 40px rgba(59,130,246,0.6), 0 0 80px rgba(59,130,246,0.3); animation:pulse 1.5s ease-in-out infinite; }
+.status { font-size:14px; color:#888; margin-top:8px; }
+.status.connected { color:#10b981; }
+@keyframes pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.05)} }
+</style>
+</head>
+<body>
+<div class="container">
+  <div id="avatar" class="avatar">🤖</div>
+  <div>Sam</div>
+  <div id="status" class="status">Connecting...</div>
+</div>
+
+<script>
+// ── AudioWorklet processor (inline, registered via Blob URL) ──────────────
+const workletCode = `
+class PCMPlayerProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    // Ring buffer: 2 minutes at 48kHz (handles any response length)
+    this.bufferSize = 5760000;
+    this.buffer = new Float32Array(this.bufferSize);
+    this.writePos = 0;
+    this.readPos = 0;
+    this.buffered = 0;
+    this.started = false;
+    this.silentFrames = 0;
+
+    this.port.onmessage = (e) => {
+      if (e.data.type === 'pcm') {
+        const samples = e.data.samples;
+        for (let i = 0; i < samples.length; i++) {
+          this.buffer[this.writePos] = samples[i];
+          this.writePos = (this.writePos + 1) % this.bufferSize;
+        }
+        this.buffered = Math.min(this.buffered + samples.length, this.bufferSize);
+        this.silentFrames = 0;
+        // Start playback after 100ms buffer (4800 samples at 48kHz)
+        if (!this.started && this.buffered > 4800) {
+          this.started = true;
+          this.port.postMessage({ type: 'started' });
+        }
+      } else if (e.data.type === 'stop') {
+        this.buffered = 0;
+        this.readPos = this.writePos;
+        this.started = false;
+        this.silentFrames = 0;
+        this.port.postMessage({ type: 'stopped' });
+      }
+    };
+  }
+
+  process(inputs, outputs) {
+    if (!this.started) return true;
+    const output = outputs[0][0];
+    for (let i = 0; i < output.length; i++) {
+      if (this.buffered > 0) {
+        output[i] = this.buffer[this.readPos];
+        this.readPos = (this.readPos + 1) % this.bufferSize;
+        this.buffered--;
+        this.silentFrames = 0;
+      } else {
+        output[i] = 0;
+        this.silentFrames++;
+      }
+    }
+    // After ~500ms of silence (24000 samples at 48kHz), signal drained
+    if (this.silentFrames > 24000 && this.started) {
+      this.started = false;
+      this.silentFrames = 0;
+      this.port.postMessage({ type: 'drained' });
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-player', PCMPlayerProcessor);
+`;
+
+// ── Main ──────────────────────────────────────────────────────────────────
+
+const params = new URLSearchParams(window.location.search);
+const sessionId = params.get('session');
+const token = params.get('token') || '';
+
+const statusEl = document.getElementById('status');
+const avatarEl = document.getElementById('avatar');
+
+let audioCtx = null;
+let workletNode = null;
+let ws = null;
+let reconnectTimer = null;
+
+async function initAudio() {
+  // Create AudioContext at 24kHz to match Cartesia output
+  audioCtx = new AudioContext({ sampleRate: 48000 });
+
+  // Register worklet from blob
+  const blob = new Blob([workletCode], { type: 'application/javascript' });
+  const url = URL.createObjectURL(blob);
+  await audioCtx.audioWorklet.addModule(url);
+  URL.revokeObjectURL(url);
+
+  // Create worklet node
+  workletNode = new AudioWorkletNode(audioCtx, 'pcm-player');
+  workletNode.connect(audioCtx.destination);
+
+  // Listen for messages from worklet
+  workletNode.port.onmessage = (e) => {
+    if (e.data.type === 'started') {
+      avatarEl.classList.add('speaking');
+      console.log('[Audio] Playback started');
+    } else if (e.data.type === 'drained' || e.data.type === 'stopped') {
+      avatarEl.classList.remove('speaking');
+      console.log('[Audio] Playback finished');
+    }
+  };
+
+  console.log('[Audio] AudioWorklet initialized at 48kHz');
+}
+
+function connectWebSocket() {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = protocol + '//' + window.location.host + '/audio/' + sessionId + '?token=' + token;
+
+  console.log('[WS] Connecting to', wsUrl);
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    statusEl.textContent = 'Connected';
+    statusEl.className = 'status connected';
+    console.log('[WS] Connected');
+
+    // Resume AudioContext if suspended (browser autoplay policy)
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+  };
+
+  ws.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      // Binary: raw PCM s16le bytes from Cartesia
+      const pcmBytes = new Int16Array(event.data);
+      // Convert Int16 → Float32 for AudioWorklet
+      const float32 = new Float32Array(pcmBytes.length);
+      for (let i = 0; i < pcmBytes.length; i++) {
+        float32[i] = pcmBytes[i] / 32768.0;
+      }
+      // Send to AudioWorklet
+      if (workletNode) {
+        workletNode.port.postMessage({ type: 'pcm', samples: float32 });
+      }
+    } else {
+      // Text: JSON control messages
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'stop') {
+          if (workletNode) {
+            workletNode.port.postMessage({ type: 'stop' });
+          }
+          avatarEl.classList.remove('speaking');
+        } else if (msg.type === 'flush') {
+          if (workletNode) {
+            workletNode.port.postMessage({ type: 'flush' });
+          }
+        }
+      } catch (e) {
+        console.warn('[WS] Non-JSON text message:', event.data);
+      }
+    }
+  };
+
+  ws.onclose = () => {
+    statusEl.textContent = 'Disconnected';
+    statusEl.className = 'status';
+    console.log('[WS] Disconnected, reconnecting in 2s...');
+    reconnectTimer = setTimeout(connectWebSocket, 2000);
+  };
+
+  ws.onerror = (err) => {
+    console.error('[WS] Error:', err);
+    ws.close();
+  };
+}
+
+// Init
+(async () => {
+  try {
+    await initAudio();
+    if (sessionId) {
+      connectWebSocket();
+    } else {
+      statusEl.textContent = 'No session ID';
+    }
+  } catch (err) {
+    statusEl.textContent = 'Audio init failed: ' + err.message;
+    console.error('[Audio] Init failed:', err);
+  }
+})();
+</script>
+</body>
+</html>
