@@ -5,3 +5,4 @@ pydub
 numpy
 fastembed
 python-dotenv
+websockets
